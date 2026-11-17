@@ -1,0 +1,19 @@
+# MounRiver / Eclipse build output
+/obj/
+/.settings/
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.siz
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

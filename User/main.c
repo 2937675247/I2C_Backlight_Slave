@@ -53,11 +53,15 @@
 #define REG_TP_ACKS       0x0F   /* bit0 地址写 bit1 命令 bit2 读地址 bit3 读完 */
 #define REG_CMD           0x10   /* 写 1 = 立即探测一次 */
 #define REG_TP_PROBE_CNT  0x11
-#define REG_TP_RAW0       0x12   /* 0x12~0x1F: AXS15260 14 字节原始数据 */
+#define REG_TP_RAW0       0x12   /* 0x12~0x1F: 原始数据前 14 字节（兼容单点） */
 #define REG_SCR_RST_LEVEL 0x20   /* PD4 屏幕复位电平 */
 #define REG_SCR_RST_CNT   0x21   /* 屏幕复位次数 */
 #define REG_TP_TOUCH_CNT  0x22   /* PC0 触摸有效次数（排查误触发） */
-#define I2C_REG_COUNT     0x23
+#define REG_MT_POINTS     0x23   /* 多点：点数 0~5 */
+#define REG_MT_POINT1     0x24   /* 0x24~0x3C: 5 点 × 5 字节（X_L,X_H,Y_L,Y_H,EVENT） */
+#define REG_MT_VALID      0x3D   /* bit0~4: 对应点有效 */
+#define REG_MT_ACTIVE     0x3E   /* 1 = 任一点触摸有效 */
+#define I2C_REG_COUNT     0x40
 
 /* 背光 PWM */
 #define PWM_FREQ_HZ      20000u
@@ -70,15 +74,7 @@ static uint32_t s_pwm_period = 0;
 
 /* I2C 从机寄存器（中断会修改，必须 volatile） */
 static volatile uint8_t s_i2c_regs[I2C_REG_COUNT] = {
-    PWM_DUTY_DEFAULT, 0x01, 0x01, I2C_SLAVE_ADDR,
-    0, 0, 0, 0,
-    0, 0, 0, 0,
-    0, 0, 0, 0,
-    0, 0, 0, 0,
-    0, 0, 0, 0,
-    0, 0, 0, 0,
-    0, 0, 0, 0,
-    0, 0, 0
+    PWM_DUTY_DEFAULT, 0x01, 0x01, I2C_SLAVE_ADDR
 };
 
 static volatile uint8_t s_probe_request = 0;
@@ -409,25 +405,22 @@ static void tp_set_result(uint8_t present, uint8_t err, uint8_t acks)
     s_i2c_regs[REG_TP_ERR] = err;
     s_i2c_regs[REG_TP_ACKS] = acks;
     if(!present || err)
-        s_i2c_regs[REG_TP_POINTS] = 0;   /* 读失败时不再保留旧点数 */
+    {
+        s_i2c_regs[REG_TP_POINTS] = 0;
+        s_i2c_regs[REG_MT_POINTS] = 0;
+        s_i2c_regs[REG_MT_VALID] = 0;
+    }
     s_i2c_regs[REG_STATUS] = 0x01u |
                              (present ? 0x02u : 0u) |
                              (err ? 0x04u : 0u);
     s_i2c_regs[REG_TP_PROBE_CNT]++;
 }
 
-/* 有触摸时把 PC0 拉低给 SoC；无触摸时释放。
- * 判定条件与 Linux 驱动一致：原始点数 1~5、事件为 down/move、坐标在屏内。
- * 再加 2 次连续采样防抖，避免单次噪声误触发。 */
+/* 有任意一点触摸时把 PC0 拉低给 SoC；无触摸时释放。
+ * MT_VALID 已在 tp_probe 里按点数/事件/坐标过滤，这里再做 2 次采样防抖。 */
 static void tp_update_int(void)
 {
-    uint8_t points = s_i2c_regs[REG_TP_POINTS];
-    uint8_t event  = s_i2c_regs[REG_TP_EVENT];
-    uint16_t x = ((uint16_t)s_i2c_regs[REG_TP_X_H] << 8) | s_i2c_regs[REG_TP_X_L];
-    uint16_t y = ((uint16_t)s_i2c_regs[REG_TP_Y_H] << 8) | s_i2c_regs[REG_TP_Y_L];
-    uint8_t valid = (points >= 1u && points <= 5u) &&
-                    (event == AXS_EVENT_DOWN || event == AXS_EVENT_MOVE) &&
-                    (x < 480u && y < 800u);
+    uint8_t valid = (s_i2c_regs[REG_MT_VALID] != 0);
 
     static uint8_t s_touch_active = 0;
     static uint8_t s_on_cnt = 0;
@@ -451,6 +444,7 @@ static void tp_update_int(void)
         s_touch_active = 1;
         PIN_LOW(GPIOC, GPIO_Pin_0);        /* INT 低有效 */
         s_i2c_regs[REG_STATUS] |= 0x08u;   /* bit3: touch active */
+        s_i2c_regs[REG_MT_ACTIVE] = 1;
         s_i2c_regs[REG_TP_TOUCH_CNT]++;
     }
     else if(s_touch_active && s_off_cnt >= 2u)
@@ -458,17 +452,19 @@ static void tp_update_int(void)
         s_touch_active = 0;
         PIN_RELEASE(GPIOC, GPIO_Pin_0);
         s_i2c_regs[REG_STATUS] &= ~0x08u;
+        s_i2c_regs[REG_MT_ACTIVE] = 0;
     }
 }
 
 static void tp_probe(void)
 {
     static const uint8_t cmd[11] = {
-        0xB5, 0xAB, 0xA5, 0x5A, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00
+        0xB5, 0xAB, 0xA5, 0x5A, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00
     };
-    uint8_t buf[14] = {0};
+    uint8_t buf[32] = {0};
     uint8_t acks = 0;
     uint8_t i;
+    uint8_t points, ev;
     uint16_t x, y;
 
     /* 先记录 INT/RST/屏幕 RST 实际电平，便于判断供电/复位 */
@@ -526,19 +522,47 @@ static void tp_probe(void)
     i2c_stop();
     acks |= 0x08u;
 
-    s_i2c_regs[REG_TP_POINTS] = buf[1];   /* 原始点数，有效 1~5，不能只看低 4 位 */
+    points = buf[1];
+    s_i2c_regs[REG_TP_POINTS] = points;   /* 原始点数，有效 1~5 */
     s_i2c_regs[REG_TP_ESD] = (buf[0] >> 4) & 0x0Fu;
-    s_i2c_regs[REG_TP_EVENT] = (buf[2] >> 4) & 0x0Fu;
+    s_i2c_regs[REG_MT_POINTS] = (points <= 5u) ? points : 0u;
+    s_i2c_regs[REG_MT_VALID] = 0;
 
-    x = ((uint16_t)(buf[2] & 0x0Fu) << 8) | buf[3];
-    y = ((uint16_t)(buf[4] & 0x0Fu) << 8) | buf[5];
+    /* AXS15260 多点数据：2 字节头 + 每点 6 字节。
+     * 每点前 4 字节：x_h/event、x_l、y_h、y_l；后 2 字节忽略。 */
+    for(i = 0; i < 5u; i++)
+    {
+        uint8_t base = (uint8_t)(2u + i * 6u);
 
-    s_i2c_regs[REG_TP_X_L] = (uint8_t)(x & 0xFFu);
-    s_i2c_regs[REG_TP_X_H] = (uint8_t)((x >> 8) & 0xFFu);
-    s_i2c_regs[REG_TP_Y_L] = (uint8_t)(y & 0xFFu);
-    s_i2c_regs[REG_TP_Y_H] = (uint8_t)((y >> 8) & 0xFFu);
+        ev = (buf[base] >> 4) & 0x0Fu;
+        x = ((uint16_t)(buf[base] & 0x0Fu) << 8) | buf[base + 1u];
+        y = ((uint16_t)(buf[base + 2u] & 0x0Fu) << 8) | buf[base + 3u];
 
-    for(i = 0; i < sizeof(buf); i++)
+        s_i2c_regs[REG_MT_POINT1 + i * 5u + 0u] = (uint8_t)(x & 0xFFu);
+        s_i2c_regs[REG_MT_POINT1 + i * 5u + 1u] = (uint8_t)((x >> 8) & 0xFFu);
+        s_i2c_regs[REG_MT_POINT1 + i * 5u + 2u] = (uint8_t)(y & 0xFFu);
+        s_i2c_regs[REG_MT_POINT1 + i * 5u + 3u] = (uint8_t)((y >> 8) & 0xFFu);
+        s_i2c_regs[REG_MT_POINT1 + i * 5u + 4u] = ev;
+
+        if(i < points && points <= 5u &&
+           (ev == AXS_EVENT_DOWN || ev == AXS_EVENT_MOVE) &&
+           x < 480u && y < 800u)
+        {
+            s_i2c_regs[REG_MT_VALID] |= (uint8_t)(1u << i);
+        }
+
+        if(i == 0u)
+        {
+            s_i2c_regs[REG_TP_EVENT] = ev;
+            s_i2c_regs[REG_TP_X_L] = (uint8_t)(x & 0xFFu);
+            s_i2c_regs[REG_TP_X_H] = (uint8_t)((x >> 8) & 0xFFu);
+            s_i2c_regs[REG_TP_Y_L] = (uint8_t)(y & 0xFFu);
+            s_i2c_regs[REG_TP_Y_H] = (uint8_t)((y >> 8) & 0xFFu);
+        }
+    }
+
+    /* 兼容旧单点调试：只保留前 14 字节原始数据 */
+    for(i = 0; i < 14u; i++)
         s_i2c_regs[REG_TP_RAW0 + i] = buf[i];
 
     tp_set_result(1, 0, acks);

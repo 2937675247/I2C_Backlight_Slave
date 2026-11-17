@@ -56,7 +56,8 @@
 #define REG_TP_RAW0       0x12   /* 0x12~0x1F: AXS15260 14 字节原始数据 */
 #define REG_SCR_RST_LEVEL 0x20   /* PD4 屏幕复位电平 */
 #define REG_SCR_RST_CNT   0x21   /* 屏幕复位次数 */
-#define I2C_REG_COUNT     0x22
+#define REG_TP_TOUCH_CNT  0x22   /* PC0 触摸有效次数（排查误触发） */
+#define I2C_REG_COUNT     0x23
 
 /* 背光 PWM */
 #define PWM_FREQ_HZ      20000u
@@ -77,7 +78,7 @@ static volatile uint8_t s_i2c_regs[I2C_REG_COUNT] = {
     0, 0, 0, 0,
     0, 0, 0, 0,
     0, 0, 0, 0,
-    0, 0
+    0, 0, 0
 };
 
 static volatile uint8_t s_probe_request = 0;
@@ -270,6 +271,8 @@ static void I2C_Slave_Init(uint32_t speed, uint8_t addr7)
 #define TP_RST_PIN    GPIO_Pin_2
 
 #define TP_I2C_ADDR   0x3B
+#define AXS_EVENT_DOWN 0x00u
+#define AXS_EVENT_MOVE 0x08u
 
 #define SDA_LOW()      PIN_LOW(TP_SDA_PORT, TP_SDA_PIN)
 #define SDA_RELEASE()  PIN_RELEASE(TP_SDA_PORT, TP_SDA_PIN)
@@ -413,18 +416,46 @@ static void tp_set_result(uint8_t present, uint8_t err, uint8_t acks)
     s_i2c_regs[REG_TP_PROBE_CNT]++;
 }
 
-/* 有触摸时把 PC0 拉低给 SoC；无触摸时释放 */
+/* 有触摸时把 PC0 拉低给 SoC；无触摸时释放。
+ * 判定条件与 Linux 驱动一致：原始点数 1~5、事件为 down/move、坐标在屏内。
+ * 再加 2 次连续采样防抖，避免单次噪声误触发。 */
 static void tp_update_int(void)
 {
     uint8_t points = s_i2c_regs[REG_TP_POINTS];
+    uint8_t event  = s_i2c_regs[REG_TP_EVENT];
+    uint16_t x = ((uint16_t)s_i2c_regs[REG_TP_X_H] << 8) | s_i2c_regs[REG_TP_X_L];
+    uint16_t y = ((uint16_t)s_i2c_regs[REG_TP_Y_H] << 8) | s_i2c_regs[REG_TP_Y_L];
+    uint8_t valid = (points >= 1u && points <= 5u) &&
+                    (event == AXS_EVENT_DOWN || event == AXS_EVENT_MOVE) &&
+                    (x < 480u && y < 800u);
 
-    if(points >= 1u && points <= 5u)
+    static uint8_t s_touch_active = 0;
+    static uint8_t s_on_cnt = 0;
+    static uint8_t s_off_cnt = 0;
+
+    if(valid)
     {
-        PIN_LOW(GPIOC, GPIO_Pin_0);        /* INT 低有效 */
-        s_i2c_regs[REG_STATUS] |= 0x08u;   /* bit3: touch active */
+        if(s_on_cnt < 3u)
+            s_on_cnt++;
+        s_off_cnt = 0;
     }
     else
     {
+        if(s_off_cnt < 3u)
+            s_off_cnt++;
+        s_on_cnt = 0;
+    }
+
+    if(!s_touch_active && s_on_cnt >= 2u)
+    {
+        s_touch_active = 1;
+        PIN_LOW(GPIOC, GPIO_Pin_0);        /* INT 低有效 */
+        s_i2c_regs[REG_STATUS] |= 0x08u;   /* bit3: touch active */
+        s_i2c_regs[REG_TP_TOUCH_CNT]++;
+    }
+    else if(s_touch_active && s_off_cnt >= 2u)
+    {
+        s_touch_active = 0;
         PIN_RELEASE(GPIOC, GPIO_Pin_0);
         s_i2c_regs[REG_STATUS] &= ~0x08u;
     }
@@ -495,7 +526,7 @@ static void tp_probe(void)
     i2c_stop();
     acks |= 0x08u;
 
-    s_i2c_regs[REG_TP_POINTS] = buf[1] & 0x0Fu;
+    s_i2c_regs[REG_TP_POINTS] = buf[1];   /* 原始点数，有效 1~5，不能只看低 4 位 */
     s_i2c_regs[REG_TP_ESD] = (buf[0] >> 4) & 0x0Fu;
     s_i2c_regs[REG_TP_EVENT] = (buf[2] >> 4) & 0x0Fu;
 
